@@ -73,14 +73,19 @@
             isRunning: false,
             isPaused: false,
             shouldStop: false,
-            queue: [],
-            completed: [],
-            failed: [],
             currentIndex: 0,
             totalImages: 0,
             startTime: null,
             selectedGroups: new Set(),
-            downloadedBytes: 0
+            valueSelections: new Map(), // groupIdx -> Set(valueIdx)
+            downloadedBytes: 0,
+            completedCount: 0,
+            failedCount: 0,
+            failedItems: [],
+            captureWidth: null,
+            captureHeight: null,
+            lastApplied: null, // Map(groupName -> valueLabel) for diff-apply optimization
+            plan: null // computed at start/resume
         },
         
         // UI
@@ -145,6 +150,53 @@
     };
 
     const formatNumber = (n) => n.toLocaleString();
+
+    const getBatchStorageKey = () => {
+        const href = (location.href || '').split('#')[0];
+        return `vitra-dl:batch:${href}`;
+    };
+
+    const batchPersistSave = (extra = {}) => {
+        try {
+            const b = state.batch;
+            if (!b.plan) return;
+            const payload = {
+                v: 1,
+                url: (location.href || '').split('#')[0],
+                productName: state.productName || '',
+                savedAt: Date.now(),
+                plan: b.plan,
+                currentIndex: b.currentIndex,
+                totalImages: b.totalImages,
+                downloadedBytes: b.downloadedBytes,
+                completedCount: b.completedCount,
+                failedCount: b.failedCount,
+                failedItems: b.failedItems?.slice?.(-200) || [],
+                captureWidth: b.captureWidth,
+                captureHeight: b.captureHeight,
+                ...extra
+            };
+            GM_setValue(getBatchStorageKey(), payload);
+        } catch (e) {
+            log('Persist save failed:', e?.message);
+        }
+    };
+
+    const batchPersistLoad = () => {
+        try {
+            return GM_getValue(getBatchStorageKey(), null);
+        } catch {
+            return null;
+        }
+    };
+
+    const batchPersistClear = () => {
+        try {
+            GM_setValue(getBatchStorageKey(), null);
+        } catch (e) {
+            log('Persist clear failed:', e?.message);
+        }
+    };
     
     const formatSize = (bytes) => {
         if (bytes < 1024) return bytes + ' B';
@@ -694,6 +746,78 @@
         return rect.width > 0 && rect.height > 0;
     };
 
+    const isNonValueControlText = (text) => {
+        const t = (text || '').trim();
+        if (!t) return true;
+        return (
+            /^filtre$/i.test(t) || /^filter$/i.test(t) ||
+            /^comparer$/i.test(t) || /^compare$/i.test(t) ||
+            /^reveler$/i.test(t) || /^révéler$/i.test(t) || /^reveal$/i.test(t) ||
+            /^fermer$/i.test(t) || /^close$/i.test(t)
+        );
+    };
+
+    const findCloseButtonIn = (root) => {
+        const r = root || document;
+        const btns = [...r.querySelectorAll('button,[role="button"]')].filter(isVisible);
+        // Prefer explicit "Fermer/Close"
+        for (const b of btns) {
+            // Never close our own UI
+            if (b.closest?.('#vitra-dl-modal, #vitra-dl-panel')) continue;
+            const aria = (b.getAttribute?.('aria-label') || b.getAttribute?.('title') || '').trim();
+            const t = getElementText(b);
+            if (/^fermer$/i.test(t) || /^close$/i.test(t) || /fermer|close/i.test(aria)) return b;
+        }
+        // Common "X" icon close
+        for (const b of btns) {
+            if (b.closest?.('#vitra-dl-modal, #vitra-dl-panel')) continue;
+            const t = getElementText(b);
+            if (t === '×' || t === '✕' || t.toLowerCase() === 'x') return b;
+        }
+        return null;
+    };
+
+    const closeBlockingOverlays = async () => {
+        // Never treat our own modal as an overlay to close.
+        const ourModal = document.getElementById('vitra-dl-modal');
+        const ourPanel = document.getElementById('vitra-dl-panel');
+
+        // Try dialog-like elements first
+        const candidates = [
+            ...document.querySelectorAll('[role="dialog"], [aria-modal="true"], dialog')
+        ].filter((el) => isVisible(el) && !(ourModal && ourModal.contains(el)) && !(ourPanel && ourPanel.contains(el)));
+        for (const c of candidates) {
+            const close = findCloseButtonIn(c);
+            if (close) {
+                close.click();
+                await sleep(250);
+                return true;
+            }
+        }
+
+        // Heuristic: if a big "Sélectionner ..." panel is open, close its top-left button
+        const headings = [...document.querySelectorAll('h1,h2,h3')].filter(isVisible);
+        const selectHeading = headings.find((h) => /sélectionner|select/i.test(getElementText(h)));
+        if (selectHeading) {
+            const container = selectHeading.closest('section,div') || document;
+            const close = findCloseButtonIn(container) || findCloseButtonIn(document);
+            if (close) {
+                close.click();
+                await sleep(250);
+                return true;
+            }
+        }
+
+        // Last resort: global close button
+        const globalClose = findCloseButtonIn(document);
+        if (globalClose) {
+            globalClose.click();
+            await sleep(250);
+            return true;
+        }
+        return false;
+    };
+
     const findBackButtonInConfigurator = () => {
         const root = findConfiguratorRoot();
         const buttons = queryClickables(root);
@@ -711,10 +835,11 @@
     const ensureAtGroupList = async () => {
         // If we're inside a detail view, a "Retour" button exists.
         for (let i = 0; i < 3; i++) {
+            await closeBlockingOverlays();
             const groups = findOptionButtons();
             if (groups.length) return true;
             const back = findBackButtonInConfigurator();
-            if (!back) return false;
+            if (!back) return findOptionButtons().length > 0;
             back.click();
             await sleep(CONFIG.batchDownload.clickDelay);
         }
@@ -754,7 +879,49 @@
         return candidates[0] || null;
     };
 
+    const ensureConfiguratorTab = async (preferred = 'Configurer') => {
+        const root = findConfiguratorRoot();
+        const tabs = [...root.querySelectorAll('[role="tab"]')];
+        if (!tabs.length) return false;
+
+        const prefKey = normalizeKey(preferred);
+        const target = tabs.find((t) => normalizeKey(getElementText(t)) === prefKey) ||
+            tabs.find((t) => normalizeKey(getElementText(t)).includes(prefKey));
+
+        if (!target) return false;
+        const selected = (target.getAttribute?.('aria-selected') || '') === 'true';
+        if (!selected) {
+            target.click();
+            await sleep(350);
+        }
+        return true;
+    };
+
+    const ensureNoFilterDrawer = async () => {
+        const root = findConfiguratorRoot();
+        const btns = queryClickables(root).filter(isVisible);
+        const close = btns.find((b) => /^fermer$/i.test(getElementText(b)) || /^close$/i.test(getElementText(b)));
+        if (close) {
+            close.click();
+            await sleep(250);
+            return true;
+        }
+        return false;
+    };
+
+    const prepareConfiguratorForAutomation = async () => {
+        // Best-effort stabilize UI before scanning/clicking
+        await closeBlockingOverlays();
+        await ensureNoFilterDrawer();
+        // Prefer "Configurer" tab, but fall back to "Recommandé" if not present on some pages
+        const ok = await ensureConfiguratorTab('Configurer');
+        if (!ok) await ensureConfiguratorTab('Recommandé');
+        await ensureNoFilterDrawer();
+        await closeBlockingOverlays();
+    };
+
     const collectAllGroupNames = async () => {
+        await prepareConfiguratorForAutomation();
         await ensureAtGroupList();
         const root = findConfiguratorRoot();
         const scrollEl = findGroupListScrollContainer();
@@ -797,11 +964,13 @@
             return groups.find(g => normalizeKey(g.name) === target) || null;
         };
 
-        // First attempt without scrolling
+        if (!scrollEl) return null;
+
+        // Deterministic: always start from top (virtualized lists can be anywhere)
+        scrollEl.scrollTop = 0;
+        await sleep(160);
         let found = tryFind();
         if (found) return found;
-
-        if (!scrollEl) return null;
 
         // Scroll down until found or end
         const max = scrollEl.scrollHeight - scrollEl.clientHeight;
@@ -810,16 +979,6 @@
             found = tryFind();
             if (found) return found;
             if (scrollEl.scrollTop >= max - 2) break;
-            scrollEl.scrollTop = Math.min(max, scrollEl.scrollTop + step);
-            await sleep(140);
-        }
-
-        // Reset and try once more (some UIs jump around)
-        scrollEl.scrollTop = 0;
-        await sleep(160);
-        for (let i = 0; i < 20; i++) {
-            found = tryFind();
-            if (found) return found;
             scrollEl.scrollTop = Math.min(max, scrollEl.scrollTop + step);
             await sleep(140);
         }
@@ -836,6 +995,7 @@
                 const t = getElementText(b);
                 if (!t) return false;
                 if (/^retour$/i.test(t) || /^back$/i.test(t)) return false;
+                if (isNonValueControlText(t)) return false;
                 if (/ajouter au panier|add to cart|panier/i.test(t)) return false;
                 if (/\boptions?\b/i.test(t)) return false;
                 // Don't treat group buttons as values
@@ -848,6 +1008,49 @@
         return findConfiguratorRoot();
     };
 
+    const collectAllValueLabelsInDetail = async (detailRoot) => {
+        const root = detailRoot || findConfiguratorRoot();
+        const scrollEl = findScrollableAncestor(queryClickables(root).find(isVisible), root) ||
+            [...root.querySelectorAll('*')].find((n) => n.scrollHeight > n.clientHeight + 40) ||
+            null;
+
+        const labels = [];
+        const seen = new Set();
+
+        const collectVisible = () => {
+            const buttons = queryClickables(root).filter(isVisible);
+            for (const btn of buttons) {
+                const text = getElementText(btn);
+                if (!text) continue;
+                if (/^retour$/i.test(text) || /^back$/i.test(text)) continue;
+                if (isNonValueControlText(text)) continue;
+                if (/ajouter au panier|add to cart|panier/i.test(text)) continue;
+                if (/\boptions?\b/i.test(text)) continue;
+                if (/^(.+?)\s*(\d+)\s*options?\s+([\s\S]+)$/i.test(text)) continue; // group button
+                if (text.length < 2 || text.length > 100) continue;
+                const k = normalizeKey(text);
+                if (!k || seen.has(k)) continue;
+                seen.add(k);
+                labels.push(text);
+            }
+        };
+
+        if (scrollEl) scrollEl.scrollTop = 0;
+        await sleep(120);
+        for (let i = 0; i < 50; i++) {
+            collectVisible();
+            if (!scrollEl) break;
+            const max = scrollEl.scrollHeight - scrollEl.clientHeight;
+            if (max <= 0) break;
+            if (scrollEl.scrollTop >= max - 2) break;
+            const step = Math.max(160, Math.floor(scrollEl.clientHeight * 0.75));
+            scrollEl.scrollTop = Math.min(max, scrollEl.scrollTop + step);
+            await sleep(140);
+        }
+
+        return labels;
+    };
+
     /**
      * Enumeration: collect option group names + option labels.
      * Important: Vitra's group list is often virtualized (only visible rows exist in DOM),
@@ -856,6 +1059,7 @@
     const enumerateAllOptions = async (progressCallback) => {
         log('Starting option enumeration...');
         state.optionGroups = [];
+        await prepareConfiguratorForAutomation();
         
         const productHeading = document.querySelector('h1, h2');
         if (productHeading) {
@@ -902,25 +1106,9 @@
 
             // Collect visible option values in the detail view
             const options = [];
-            const seenVals = new Set();
             const detailRoot = findDetailViewContainer(backBtn);
-            const detailButtons = queryClickables(detailRoot);
-
-            for (const btn of detailButtons) {
-                if (!isVisible(btn)) continue;
-                const text = getElementText(btn);
-                if (!text) continue;
-                if (/^retour$/i.test(text) || /^back$/i.test(text)) continue;
-                if (/ajouter au panier|add to cart|panier/i.test(text)) continue;
-                if (/\boptions?\b/i.test(text)) continue;
-                if (/^(.+?)\s*(\d+)\s*options?\s+([\s\S]+)$/i.test(text)) continue; // group button
-                if (text.length < 2 || text.length > 100) continue;
-
-                const key = normalizeKey(text);
-                if (!key || seenVals.has(key)) continue;
-                seenVals.add(key);
-                options.push({ label: text });
-            }
+            const labels = await collectAllValueLabelsInDetail(detailRoot);
+            labels.forEach((label) => options.push({ label }));
 
             state.optionGroups.push({
                 name: optBtn.name,
@@ -945,6 +1133,7 @@
     };
 
     const applyOptionSelection = async (groupName, valueLabel) => {
+        await prepareConfiguratorForAutomation();
         await ensureAtGroupList();
 
         const scrollEl = findGroupListScrollContainer();
@@ -961,16 +1150,35 @@
             await sleep(80);
         }
         const backBtn = findBackButtonInConfigurator();
-        const detailRoot = findDetailViewContainer(backBtn);
+        let detailRoot = findDetailViewContainer(backBtn);
+        // Close filter drawer if opened (batch must click values, not filter UI)
+        await ensureNoFilterDrawer();
+        await closeBlockingOverlays();
 
         const target = normalizeKey(valueLabel);
-        const buttons = queryClickables(detailRoot).filter(isVisible);
-        let match = buttons.find((b) => normalizeKey(getElementText(b)) === target);
-        if (!match) {
+        const findMatchIn = (root) => {
+            const buttons = queryClickables(root).filter(isVisible);
+            // Exact match first
+            let match = buttons.find((b) => normalizeKey(getElementText(b)) === target);
+            if (match) return match;
+            // Fuzzy: accept partial/token-ish matches
             match = buttons.find((b) => {
                 const k = normalizeKey(getElementText(b));
-                return k && (k.includes(target) || target.includes(k));
+                return k && !isNonValueControlText(getElementText(b)) && (k.includes(target) || target.includes(k));
             });
+            return match || null;
+        };
+
+        let match = findMatchIn(detailRoot);
+        if (!match) {
+            // Fallback: sometimes the container detection can lock onto the header (Filtre/Comparer).
+            // Expand search to the configurator root when needed.
+            detailRoot = findConfiguratorRoot();
+            match = findMatchIn(detailRoot);
+        }
+        if (!match) {
+            // Last fallback: broaden to the entire document (rare layouts)
+            match = findMatchIn(document);
         }
         if (!match) throw new Error(`Value not found: ${valueLabel} (group: ${groupName})`);
 
@@ -979,6 +1187,7 @@
         await sleep(CONFIG.batchDownload.clickDelay);
 
         // Back to group list (best effort)
+        await closeBlockingOverlays();
         const backAfter = findBackButtonInConfigurator();
         if (backAfter) {
             backAfter.click();
@@ -1012,29 +1221,42 @@
     const batchController = {
         async start() {
             const batch = state.batch;
-            if (batch.queue.length === 0) return;
+            if (!batch.plan || !batch.totalImages) return;
             
             batch.isRunning = true;
             batch.isPaused = false;
             batch.shouldStop = false;
             batch.startTime = Date.now();
             
-            addLogEntry(`Starting: ${batch.queue.length} images (3D Viewer)`, 'info');
+            addLogEntry(`Starting: ${batch.totalImages} images (3D Viewer)`, 'info');
             updateBatchUI();
+            batchPersistSave({ status: 'running' });
             
-            while (batch.currentIndex < batch.queue.length && !batch.shouldStop) {
+            while (batch.currentIndex < batch.totalImages && !batch.shouldStop) {
                 while (batch.isPaused && !batch.shouldStop) {
                     await sleep(100);
                 }
                 if (batch.shouldStop) break;
                 
-                const item = batch.queue[batch.currentIndex];
+                const idx = batch.currentIndex;
+                const combo = comboForIndex(batch.plan, idx);
+
+                const labels = combo.map(c => sanitizeFilename(c.valueLabel)).join('_');
+                const base = sanitizeFilename(state.productName || 'product');
+                const filename = `vitra_3d_${base}_${labels}_${idx}.png`;
+
+                const actions = diffActions(combo, batch.lastApplied);
                 
                 try {
-                    // Apply option selections for this combination
-                    if (item.clickActions) {
-                        for (const action of item.clickActions) {
-                            await applyOptionSelection(action.optionName, action.valueLabel);
+                    // Apply option selections (diff-only when possible)
+                    if (!batch.lastApplied) {
+                        // First iteration (or after resume): apply all to ensure correctness
+                        for (const action of combo) {
+                            await applyOptionSelection(action.groupName, action.valueLabel);
+                        }
+                    } else {
+                        for (const action of actions) {
+                            await applyOptionSelection(action.groupName, action.valueLabel);
                         }
                     }
 
@@ -1042,57 +1264,82 @@
                     await sleep(CONFIG.batchDownload.delayBetweenCaptures);
 
                     // Capture
-                    const cap = await captureViewerWithSettings(batch.captureWidth, batch.captureHeight, {
-                        useWhiteBackground: state.viewerCapture.useWhiteBackground,
-                        useFullscreenBoost: state.viewerCapture.useFullscreenBoost
-                    });
-                    downloadBlob(cap.blob, item.filename);
-                    batch.completed.push({ ...item, size: cap.blob.size });
-                    batch.downloadedBytes += cap.blob.size;
-                    
-                    addLogEntry(`✓ ${item.filename}`, 'success');
+                    let lastErr = null;
+                    for (let attempt = 1; attempt <= CONFIG.batchDownload.retryAttempts; attempt++) {
+                        try {
+                            const cap = await captureViewerWithSettings(batch.captureWidth, batch.captureHeight, {
+                                useWhiteBackground: state.viewerCapture.useWhiteBackground,
+                                useFullscreenBoost: state.viewerCapture.useFullscreenBoost
+                            });
+                            downloadBlob(cap.blob, filename);
+                            batch.downloadedBytes += cap.blob.size;
+                            batch.completedCount++;
+                            addLogEntry(`✓ ${filename}`, 'success');
+                            lastErr = null;
+                            break;
+                        } catch (e) {
+                            lastErr = e;
+                            addLogEntry(`Retry ${attempt}/${CONFIG.batchDownload.retryAttempts} failed: ${e.message}`, 'warning');
+                            await sleep(600);
+                        }
+                    }
+                    if (lastErr) throw lastErr;
+
+                    // Mark as last applied (for diff-only next iteration)
+                    if (!batch.lastApplied) batch.lastApplied = new Map();
+                    combo.forEach((c) => batch.lastApplied.set(c.groupName, c.valueLabel));
                     
                 } catch (e) {
-                    batch.failed.push({ ...item, error: e.message });
-                    addLogEntry(`✗ ${item.filename}: ${e.message}`, 'error');
+                    batch.failedCount++;
+                    batch.failedItems.push({ index: idx, error: e.message, labels: combo.map(c => `${c.groupName}=${c.valueLabel}`) });
+                    batch.failedItems = batch.failedItems.slice(-200);
+                    addLogEntry(`✗ ${filename}: ${e.message}`, 'error');
                 }
                 
                 batch.currentIndex++;
                 updateBatchUI();
+                batchPersistSave();
                 
                 await sleep(500);
             }
             
             batch.isRunning = false;
             updateBatchUI();
-            addLogEntry(`Complete: ${batch.completed.length} done, ${batch.failed.length} failed`, 'info');
+            addLogEntry(`Complete: ${batch.completedCount} done, ${batch.failedCount} failed`, 'info');
+            batchPersistSave({ status: batch.shouldStop ? 'stopped' : 'complete' });
         },
         
         pause() {
             state.batch.isPaused = true;
             addLogEntry('Paused', 'warning');
             updateBatchUI();
+            batchPersistSave({ status: 'paused' });
         },
         
         resume() {
             state.batch.isPaused = false;
             addLogEntry('Resumed', 'info');
             updateBatchUI();
+            batchPersistSave({ status: 'running' });
         },
         
         stop() {
             state.batch.shouldStop = true;
             state.batch.isPaused = false;
             updateBatchUI();
+            batchPersistSave({ status: 'stopping' });
         },
         
         restart() {
             const batch = state.batch;
             batch.currentIndex = 0;
-            batch.completed = [];
-            batch.failed = [];
             batch.downloadedBytes = 0;
+            batch.completedCount = 0;
+            batch.failedCount = 0;
+            batch.failedItems = [];
             batch.shouldStop = false;
+            batch.lastApplied = null;
+            batchPersistSave({ status: 'restarted' });
             this.start();
         }
     };
@@ -1456,6 +1703,70 @@
         .vdl-log-entry.error { color: #ef4444; }
         .vdl-log-entry.warning { color: #f59e0b; }
         .vdl-log-entry.info { color: #3b82f6; }
+
+        .vdl-values {
+            margin-top: 14px;
+            padding-top: 14px;
+            border-top: 1px solid rgba(255,255,255,0.08);
+        }
+
+        .vdl-values details {
+            background: rgba(255,255,255,0.04);
+            border-radius: 8px;
+            padding: 10px 12px;
+            margin-bottom: 10px;
+        }
+
+        .vdl-values summary {
+            cursor: pointer;
+            font-weight: 600;
+            font-size: 12px;
+            color: #e4e4e7;
+            outline: none;
+        }
+
+        .vdl-values-tools {
+            display: flex;
+            gap: 8px;
+            margin: 10px 0;
+            flex-wrap: wrap;
+        }
+
+        .vdl-btn-mini {
+            width: auto;
+            padding: 6px 10px;
+            margin: 0;
+            font-size: 11px;
+            border-radius: 6px;
+        }
+
+        .vdl-values-search {
+            width: 100%;
+            padding: 8px 10px;
+            border: 1px solid rgba(255,255,255,0.15);
+            border-radius: 6px;
+            background: rgba(0,0,0,0.3);
+            color: #e4e4e7;
+            font-size: 12px;
+        }
+
+        .vdl-values-list {
+            max-height: 180px;
+            overflow: auto;
+            padding-right: 4px;
+        }
+
+        .vdl-values-item {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 6px 4px;
+            border-radius: 6px;
+        }
+
+        .vdl-values-item:hover {
+            background: rgba(255,255,255,0.06);
+        }
         
         .vdl-info-box {
             background: rgba(59, 130, 246, 0.1);
@@ -1535,7 +1846,7 @@
                         🔍 Scan All Options
                     </button>
                     <button class="vdl-btn vdl-btn-primary" id="vdl-open-batch">
-                        📦 Batch Download ALL
+                        📦 Open Batch Assistant…
                     </button>
                 </div>
                 
@@ -1637,6 +1948,7 @@
                     <button class="vdl-modal-close" id="vdl-modal-close">&times;</button>
                 </div>
                 <div class="vdl-modal-body">
+                    <div id="vdl-resume-banner"></div>
                     <div class="vdl-info-box">
                         <strong>3D Viewer Batch:</strong> This will iterate option combinations and capture the 3D view for each.
                         Captures are <strong>cropped/downscaled</strong> to your requested size (no upscaling).
@@ -1706,6 +2018,15 @@
                             `).join('')
                         }
                     </div>
+
+                    <!-- Value filters (per selected group) -->
+                    <div class="vdl-values" id="vdl-values">
+                        <div class="vdl-section-title">Filter Option Values (optional)</div>
+                        <div style="font-size:11px;color:#9ca3af;margin-bottom:10px;">
+                            By default, all values are included for each selected group. You can uncheck specific values below.
+                        </div>
+                        <div id="vdl-values-filters"></div>
+                    </div>
                     
                     <!-- Controls -->
                     <div class="vdl-controls">
@@ -1728,7 +2049,150 @@
         state.modal = modal;
         
         setupBatchModalEvents();
+        renderResumeBanner();
+        syncValueSelectionsFromSelectedGroups();
+        renderValueFilters();
         updateTotalEstimate();
+    };
+
+    const renderResumeBanner = () => {
+        const el = document.getElementById('vdl-resume-banner');
+        if (!el) return;
+        const saved = batchPersistLoad();
+        if (!saved?.plan || typeof saved.currentIndex !== 'number') {
+            el.innerHTML = '';
+            return;
+        }
+
+        const pct = saved.totalImages > 0 ? Math.round((saved.currentIndex / saved.totalImages) * 100) : 0;
+        const when = new Date(saved.savedAt || Date.now()).toLocaleString();
+        el.innerHTML = `
+            <div class="vdl-warning-box" style="margin-bottom:16px;">
+                <strong>Saved progress found</strong> (${pct}% — ${saved.currentIndex} / ${saved.totalImages})<br>
+                <span style="font-size:11px;opacity:.9">Saved at: ${when}</span>
+                <div class="vdl-controls" style="margin-top:10px;margin-bottom:0;">
+                    <button class="vdl-btn vdl-btn-success vdl-btn-mini" id="vdl-resume-saved">▶️ Resume saved</button>
+                    <button class="vdl-btn vdl-btn-secondary vdl-btn-mini" id="vdl-clear-saved">🗑️ Clear</button>
+                </div>
+            </div>
+        `;
+
+        document.getElementById('vdl-resume-saved')?.addEventListener('click', async () => {
+            try {
+                await resumeSavedBatch();
+            } catch (e) {
+                addLogEntry(`Resume failed: ${e.message}`, 'error');
+            }
+        });
+        document.getElementById('vdl-clear-saved')?.addEventListener('click', () => {
+            batchPersistClear();
+            renderResumeBanner();
+            addLogEntry('Cleared saved progress for this product URL', 'info');
+        });
+    };
+
+    const syncValueSelectionsFromSelectedGroups = () => {
+        const batch = state.batch;
+        const selected = Array.from(batch.selectedGroups);
+        // Init default selections to "all values"
+        for (const idx of selected) {
+            if (!batch.valueSelections.has(idx)) {
+                const set = new Set();
+                const opts = state.optionGroups[idx]?.options || [];
+                for (let vi = 0; vi < opts.length; vi++) set.add(vi);
+                batch.valueSelections.set(idx, set);
+            }
+        }
+        // Remove selections for unselected groups
+        for (const k of Array.from(batch.valueSelections.keys())) {
+            if (!batch.selectedGroups.has(k)) batch.valueSelections.delete(k);
+        }
+    };
+
+    const renderValueFilters = () => {
+        const container = document.getElementById('vdl-values-filters');
+        if (!container) return;
+
+        const indices = Array.from(state.batch.selectedGroups);
+        if (indices.length === 0) {
+            container.innerHTML = `<div style="color:#6b7280;font-size:12px;">Select one or more option groups above to filter values.</div>`;
+            return;
+        }
+
+        container.innerHTML = indices.map((groupIdx) => {
+            const group = state.optionGroups[groupIdx];
+            const sel = state.batch.valueSelections.get(groupIdx) || new Set();
+            const count = sel.size;
+            const total = group?.options?.length || 0;
+            const safeName = String(group?.name || `Group ${groupIdx}`);
+
+            const items = (group?.options || []).map((opt, vi) => {
+                const id = `vdl-val-${groupIdx}-${vi}`;
+                const checked = sel.has(vi) ? 'checked' : '';
+                const label = opt?.label || '';
+                return `
+                    <label class="vdl-values-item" data-label="${sanitizeFilename(label).toLowerCase()}">
+                        <input type="checkbox" id="${id}" data-group="${groupIdx}" data-val="${vi}" ${checked} />
+                        <span>${label}</span>
+                    </label>
+                `;
+            }).join('');
+
+            return `
+                <details data-group="${groupIdx}">
+                    <summary>${safeName} — ${count}/${total}</summary>
+                    <div class="vdl-values-tools">
+                        <button class="vdl-btn vdl-btn-secondary vdl-btn-mini" data-action="all" data-group="${groupIdx}">All</button>
+                        <button class="vdl-btn vdl-btn-secondary vdl-btn-mini" data-action="none" data-group="${groupIdx}">None</button>
+                    </div>
+                    <input class="vdl-values-search" placeholder="Search values…" data-group="${groupIdx}" />
+                    <div class="vdl-values-list">${items}</div>
+                </details>
+            `;
+        }).join('');
+
+        // Wire up events
+        container.querySelectorAll('input[type="checkbox"][data-group][data-val]').forEach((cb) => {
+            cb.addEventListener('change', () => {
+                const g = parseInt(cb.dataset.group);
+                const v = parseInt(cb.dataset.val);
+                const set = state.batch.valueSelections.get(g) || new Set();
+                if (cb.checked) set.add(v);
+                else set.delete(v);
+                state.batch.valueSelections.set(g, set);
+                updateTotalEstimate();
+                // Update summary counts
+                renderValueFilters(); // simple re-render to keep counts accurate
+            });
+        });
+
+        container.querySelectorAll('button[data-action][data-group]').forEach((btn) => {
+            btn.addEventListener('click', (e) => {
+                e.preventDefault();
+                const g = parseInt(btn.dataset.group);
+                const action = btn.dataset.action;
+                const opts = state.optionGroups[g]?.options || [];
+                const set = new Set();
+                if (action === 'all') {
+                    for (let i = 0; i < opts.length; i++) set.add(i);
+                }
+                state.batch.valueSelections.set(g, set);
+                updateTotalEstimate();
+                renderValueFilters();
+            });
+        });
+
+        container.querySelectorAll('input.vdl-values-search[data-group]').forEach((inp) => {
+            inp.addEventListener('input', () => {
+                const q = sanitizeFilename(inp.value || '').toLowerCase();
+                const details = container.querySelector(`details[data-group="${inp.dataset.group}"]`);
+                if (!details) return;
+                details.querySelectorAll('.vdl-values-item').forEach((row) => {
+                    const key = row.getAttribute('data-label') || '';
+                    row.style.display = !q || key.includes(q) ? '' : 'none';
+                });
+            });
+        });
     };
 
     const setupBatchModalEvents = () => {
@@ -1749,6 +2213,8 @@
                 card.classList.toggle('selected');
                 card.querySelector('input').checked = card.classList.contains('selected');
                 updateTotalEstimate();
+                syncValueSelectionsFromSelectedGroups();
+                renderValueFilters();
             });
         });
         
@@ -1764,10 +2230,13 @@
         const indices = Array.from(selected).map(c => parseInt(c.dataset.idx));
         
         state.batch.selectedGroups = new Set(indices);
+        syncValueSelectionsFromSelectedGroups();
         
         let total = indices.length > 0 ? 1 : 0;
         indices.forEach(i => {
-            total *= state.optionGroups[i]?.options.length || 1;
+            const sel = state.batch.valueSelections.get(i);
+            const count = sel ? sel.size : (state.optionGroups[i]?.options.length || 0);
+            total *= count || 0;
         });
         
         document.getElementById('vdl-total').textContent = formatNumber(total);
@@ -1783,70 +2252,31 @@
             return;
         }
         
-        // Build queue
-        // For simplicity, we'll iterate through each option of selected groups
-        batch.queue = [];
-
         // Capture size (max; will not upscale beyond native)
         batch.captureWidth = parseInt(document.getElementById('vdl-batch-width')?.value) || CONFIG.viewerCapture.defaultWidth;
         batch.captureHeight = parseInt(document.getElementById('vdl-batch-height')?.value) || CONFIG.viewerCapture.defaultHeight;
-        
-        const groups = indices.map(i => state.optionGroups[i]);
-        const combinations = generateCombinations(groups);
-        
-        combinations.forEach((combo, idx) => {
-            const labels = combo.map(c => sanitizeFilename(c.label)).join('_');
-            const base = sanitizeFilename(state.productName || 'product');
-            const filename = `vitra_3d_${base}_${labels}_${idx}.png`;
-            
-            batch.queue.push({
-                filename,
-                clickActions: combo.map(c => ({ 
-                    optionName: c.groupName,
-                    valueLabel: c.label 
-                })),
-                labels: combo
-            });
-        });
-        
-        batch.totalImages = batch.queue.length;
+
+        // Build batch plan (lazy combos, no giant queue)
+        batch.plan = buildBatchPlan();
+        batch.totalImages = batch.plan.totalImages;
         batch.currentIndex = 0;
-        batch.completed = [];
-        batch.failed = [];
+        batch.completedCount = 0;
+        batch.failedCount = 0;
+        batch.failedItems = [];
         batch.downloadedBytes = 0;
+        batch.lastApplied = null;
         
         document.getElementById('vdl-progress-section').style.display = 'block';
-        
+        batchPersistSave({ status: 'starting' });
         batchController.start();
-    };
-
-    const generateCombinations = (groups) => {
-        if (groups.length === 0) return [];
-        
-        let result = groups[0].options.map(opt => [{
-            ...opt,
-            groupName: groups[0].name
-        }]);
-        
-        for (let i = 1; i < groups.length; i++) {
-            const newResult = [];
-            for (const combo of result) {
-                for (const opt of groups[i].options) {
-                    newResult.push([...combo, { ...opt, groupName: groups[i].name }]);
-                }
-            }
-            result = newResult;
-        }
-        
-        return result;
     };
 
     const updateBatchUI = () => {
         const batch = state.batch;
         if (!state.modal) return;
         
-        document.getElementById('vdl-completed').textContent = formatNumber(batch.completed.length);
-        document.getElementById('vdl-failed').textContent = formatNumber(batch.failed.length);
+        document.getElementById('vdl-completed').textContent = formatNumber(batch.completedCount || 0);
+        document.getElementById('vdl-failed').textContent = formatNumber(batch.failedCount || 0);
         document.getElementById('vdl-size').textContent = formatSize(batch.downloadedBytes);
         
         // ETA
@@ -1884,6 +2314,125 @@
         while (log.children.length > 200) {
             log.removeChild(log.firstChild);
         }
+    };
+
+    const buildBatchPlan = () => {
+        const batch = state.batch;
+        const groupIndices = Array.from(batch.selectedGroups);
+        if (groupIndices.length === 0) throw new Error('No option groups selected');
+
+        const allowedValueIdxByGroup = {};
+        const groups = [];
+
+        for (const gi of groupIndices) {
+            const group = state.optionGroups[gi];
+            if (!group) continue;
+            const sel = batch.valueSelections.get(gi);
+            const allowed = sel ? Array.from(sel) : [...Array(group.options.length).keys()];
+            const normalized = allowed
+                .filter((i) => Number.isFinite(i))
+                .map((i) => parseInt(i))
+                .filter((i) => i >= 0 && i < (group.options?.length || 0));
+            if (normalized.length === 0) throw new Error(`No values selected for group: ${group.name}`);
+            allowedValueIdxByGroup[gi] = normalized;
+            groups.push({ groupIdx: gi, name: group.name, options: group.options });
+        }
+
+        // Total combos
+        let total = 1;
+        for (const g of groups) {
+            total *= (allowedValueIdxByGroup[g.groupIdx]?.length || 0);
+        }
+        if (!Number.isFinite(total) || total <= 0) throw new Error('Total combinations is 0');
+
+        return {
+            v: 1,
+            createdAt: Date.now(),
+            url: (location.href || '').split('#')[0],
+            productName: state.productName || '',
+            captureWidth: batch.captureWidth,
+            captureHeight: batch.captureHeight,
+            groupIndices,
+            allowedValueIdxByGroup,
+            totalImages: total
+        };
+    };
+
+    const comboForIndex = (plan, index) => {
+        const groups = plan.groupIndices.map((gi) => state.optionGroups[gi]).filter(Boolean);
+        const selections = [];
+        let n = index;
+        for (let gi = groups.length - 1; gi >= 0; gi--) {
+            const groupIdx = plan.groupIndices[gi];
+            const group = state.optionGroups[groupIdx];
+            const allowed = plan.allowedValueIdxByGroup[groupIdx] || [];
+            const base = allowed.length;
+            const digit = base ? (n % base) : 0;
+            n = base ? Math.floor(n / base) : 0;
+            const valueIdx = allowed[digit];
+            const label = group?.options?.[valueIdx]?.label || '';
+            selections.unshift({
+                groupIdx,
+                groupName: group?.name || '',
+                valueIdx,
+                valueLabel: label
+            });
+        }
+        return selections;
+    };
+
+    const diffActions = (combo, lastApplied) => {
+        if (!lastApplied) return combo;
+        return combo.filter((c) => lastApplied.get(c.groupName) !== c.valueLabel);
+    };
+
+    const resumeSavedBatch = async () => {
+        const saved = batchPersistLoad();
+        if (!saved?.plan) throw new Error('No saved progress found for this URL');
+
+        const batch = state.batch;
+        batch.plan = saved.plan;
+        batch.totalImages = saved.totalImages || saved.plan.totalImages || 0;
+        batch.currentIndex = saved.currentIndex || 0;
+        batch.downloadedBytes = saved.downloadedBytes || 0;
+        batch.completedCount = saved.completedCount || 0;
+        batch.failedCount = saved.failedCount || 0;
+        batch.failedItems = saved.failedItems || [];
+        batch.captureWidth = saved.captureWidth || saved.plan.captureWidth || CONFIG.viewerCapture.defaultWidth;
+        batch.captureHeight = saved.captureHeight || saved.plan.captureHeight || CONFIG.viewerCapture.defaultHeight;
+        batch.lastApplied = null;
+        batch.shouldStop = false;
+        batch.isPaused = false;
+
+        // Sync UI selections from plan
+        batch.selectedGroups = new Set(saved.plan.groupIndices || []);
+        batch.valueSelections = new Map();
+        for (const gi of (saved.plan.groupIndices || [])) {
+            const allowed = saved.plan.allowedValueIdxByGroup?.[gi] || [];
+            batch.valueSelections.set(gi, new Set(allowed));
+        }
+
+        // Update modal UI
+        document.querySelectorAll('.vdl-option-card').forEach((card) => {
+            const idx = parseInt(card.dataset.idx);
+            const on = batch.selectedGroups.has(idx);
+            card.classList.toggle('selected', on);
+            const inp = card.querySelector('input');
+            if (inp) inp.checked = on;
+        });
+        renderValueFilters();
+        updateTotalEstimate();
+        // Restore capture size inputs
+        const w = document.getElementById('vdl-batch-width');
+        const h = document.getElementById('vdl-batch-height');
+        if (w) w.value = String(batch.captureWidth);
+        if (h) h.value = String(batch.captureHeight);
+
+        document.getElementById('vdl-progress-section').style.display = 'block';
+        // Immediately reflect restored progress in UI before starting
+        updateBatchUI();
+        addLogEntry(`Resuming saved batch at ${batch.currentIndex}/${batch.totalImages}…`, 'info');
+        batchController.start();
     };
 
     // ═══════════════════════════════════════════════════════════════════════════
