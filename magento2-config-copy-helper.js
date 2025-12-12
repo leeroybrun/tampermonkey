@@ -78,7 +78,8 @@
 
     // Function to show copy feedback
     function showCopyFeedback(button) {
-        var feedback = button.nextElementSibling;
+        // Find sibling of button's parent
+        var feedback = button.parentNode.querySelector('.config-copy-feedback');
         feedback.classList.add('show');
         setTimeout(function() {
             feedback.classList.remove('show');
@@ -87,6 +88,13 @@
 
     // Function to extract config section from URL or form
     function getConfigSection() {
+        // Try to get section from URL path first, e.g., /admin/system_config/edit/section/payment/
+        var pathMatch = window.location.pathname.match(/section\/([^\/]+)/);
+        if (pathMatch && pathMatch[1]) {
+            return pathMatch[1];
+        }
+
+        // Then check for section in query params
         var urlParams = new URLSearchParams(window.location.search);
         var section = urlParams.get('section');
         if (section) return section;
@@ -108,6 +116,31 @@
         }
 
         return 'unknown_section';
+    }
+
+    // Function to get the current scope
+    function getCurrentScope() {
+        var storeInput = document.getElementById('store_switcher');
+        var websiteInput = document.getElementById('website_switcher');
+
+        // Check for store view scope first (most specific)
+        if (storeInput && storeInput.value && storeInput.value !== '0') {
+            return {
+                type: 'stores',
+                id: storeInput.value
+            };
+        }
+
+        // Then check for website scope
+        if (websiteInput && websiteInput.value && websiteInput.value !== '0') {
+            return {
+                type: 'websites',
+                id: websiteInput.value
+            };
+        }
+
+        // Otherwise, it's the default scope
+        return { type: 'default', id: 0 };
     }
 
     // Function to parse field name and extract config path components
@@ -226,27 +259,61 @@
         if (!pathComponents) return;
 
         var section = getConfigSection();
-        var configPath = section + '/' + pathComponents.group + '/' + pathComponents.field;
-        var value = getFieldValue(field);
+        var groupPath = pathComponents.group;
+        var fieldPath = pathComponents.field;
+        var configPath;
 
-        console.log('Creating buttons for path:', configPath, 'value:', value);
+        // Special handling for Mollie module's non-standard config paths
+        if (section === 'mollie' || section === 'mollie_general' || section === 'second_chance_email') {
+            section = 'payment';
+
+            if (groupPath.indexOf('mollie_methods_') === -1) {
+                groupPath = 'mollie_general';
+            }
+        }
+
+        configPath = section + '/' + groupPath + '/' + fieldPath;
+
+        var value = getFieldValue(field);
+        var scope = getCurrentScope();
+
+        console.log('Creating buttons for path:', configPath, 'value:', value, 'scope:', scope);
 
         // Create button container
         var buttonContainer = document.createElement('div');
         buttonContainer.style.display = 'inline-block';
         buttonContainer.style.marginLeft = '10px';
 
-        // CLI format button
+        // MAG CLI format button
         var cliButton = document.createElement('button');
-        cliButton.textContent = 'CLI';
+        cliButton.textContent = 'MAG CLI';
         cliButton.className = 'config-copy-btn cli';
         cliButton.title = 'Copy as CLI command';
         cliButton.onclick = function(e) {
             e.preventDefault();
             var escapedValue = escapeValue(value, 'cli');
-            var cliCommand = 'magento config:set "' + configPath + '" "' + escapedValue + '"';
+            var cliCommand = 'bin/console magento config:set "' + configPath + '" "' + escapedValue + '"';
+            if (scope.type !== 'default' && scope.id) {
+                 cliCommand += ' --scope ' + scope.type + ' --scope-code ' + scope.id;
+            }
             copyToClipboard(cliCommand);
             showCopyFeedback(cliButton);
+        };
+
+        // CLI format button
+        var batButton = document.createElement('button');
+        batButton.textContent = 'BAT CLI';
+        batButton.className = 'config-copy-btn cli';
+        batButton.title = 'Copy as CLI command';
+        batButton.onclick = function(e) {
+            e.preventDefault();
+            var escapedValue = escapeValue(value, 'cli');
+            var cliCommand = 'bin/console magento batiplus:config:set "' + configPath + '" "' + escapedValue + '"';
+            if (scope.type !== 'default' && scope.id) {
+                cliCommand += ' --scope-type "' + scope.type + '" --scope-id "' + scope.id + '"';
+            }
+            copyToClipboard(cliCommand);
+            showCopyFeedback(batButton);
         };
 
         // Config.php format button
@@ -263,19 +330,16 @@
         };
 
         // Feedback elements
-        var cliFeedback = document.createElement('span');
-        cliFeedback.className = 'config-copy-feedback';
-        cliFeedback.textContent = 'Copied!';
-
-        var configFeedback = document.createElement('span');
-        configFeedback.className = 'config-copy-feedback';
-        configFeedback.textContent = 'Copied!';
+        var feedback = document.createElement('span');
+        feedback.className = 'config-copy-feedback';
+        feedback.id = 'btn-copy-feedback';
+        feedback.textContent = 'Copied!';
 
         // Append elements
         buttonContainer.appendChild(cliButton);
-        buttonContainer.appendChild(cliFeedback);
+        buttonContainer.appendChild(batButton);
         buttonContainer.appendChild(configButton);
-        buttonContainer.appendChild(configFeedback);
+        buttonContainer.appendChild(feedback);
 
         // Find the best place to insert the buttons
         var valueCell = field.closest('td');
